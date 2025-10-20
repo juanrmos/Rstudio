@@ -1,0 +1,518 @@
+```{r}
+# Cargar librerías necesarias
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(stringr)
+library(scales)
+library(tidyr)
+library(forcats)
+library(ggrepel)
+library(patchwork)
+
+
+# 1. LIMPIEZA Y PREPARACIÓN DE DATOS
+
+
+# Cargar los datos
+datos <- read_excel("DRTC-H.xlsx")
+
+
+# Corregir nombres de columnas (quitar acentos y caracteres especiales)
+names(datos) <- c("N", "Entidad", "Tipo_Orden", "Numero_Orden", "Tipo_Contratacion",
+                  "Fecha_Emision", "Fecha_Compromiso", "Monto", "RUC", 
+                  "Razon_Social", "Estado", "Estado_Registro", "Observaciones")
+
+# Convertir fechas a formato Date
+datos <- datos %>%
+  mutate(
+    Fecha_Emision = as.Date(Fecha_Emision),
+    Fecha_Compromiso = as.Date(Fecha_Compromiso)
+  )
+
+
+# Convertir montos a numérico
+datos <- datos %>%
+  mutate(
+    Monto_limpio = as.numeric(gsub(",", "", gsub("^S/\\. ", "", Monto)))
+  )
+
+
+
+# Eliminar filas con montos nulos si las hay
+datos <- datos %>% filter(!is.na(Monto_limpio))
+datos <- datos %>%
+  mutate(Nombre_Corto = ifelse(nchar(Razon_Social) > 15, 
+                               paste0(substr(Razon_Social, 1, 12), "..."), 
+                               Razon_Social))
+
+
+
+```
+
+```{r}
+total_general <- sum(datos$Monto_limpio)
+
+# Luego calculamos el top 5 y los porcentajes
+top5_proveedores <- datos %>%
+  group_by(Razon_Social) %>%
+  summarise(Monto_Total = sum(Monto_limpio)) %>%
+  arrange(desc(Monto_Total)) %>%
+  mutate(Porcentaje = Monto_Total / total_general * 100) %>%  
+  slice_head(n = 5)
+
+Top5 = ggplot(top5_proveedores, aes(x = reorder(Razon_Social, Monto_Total), y = Monto_Total, fill = Razon_Social)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  geom_text(aes(label = paste0(round(Porcentaje, 1), "%")), hjust = -0.2) +
+  labs(title = "Top 5 Proveedores por Monto y % del Total",
+       x = "Proveedor", y = "Monto Total (S/.)") +
+  scale_y_continuous(labels = comma) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+Top5
+ggsave("Top5.png", plot = Top5,
+width = 8, height = 6, dpi = 300)
+
+```
+
+```{r}
+# Preparar datos para curva de Pareto
+pareto <- datos %>%
+  group_by(Razon_Social) %>%
+  summarise(Monto_Total = sum(Monto_limpio)) %>%
+  arrange(desc(Monto_Total)) %>%
+  mutate(
+    Acumulado = cumsum(Monto_Total),
+    Porcentaje_Acum = Acumulado / sum(Monto_Total) * 100,
+    Proveedor_ID = row_number()
+  )
+
+# Gráfico de Pareto corregido
+Pareto = ggplot(pareto, aes(x = Proveedor_ID)) +
+  geom_bar(aes(y = Monto_Total), stat = "identity", fill = "steelblue", alpha = 0.7) +
+  geom_line(aes(y = Acumulado * max(Monto_Total) / max(Acumulado)), 
+            color = "red", linewidth = 1) +
+  geom_point(aes(y = Acumulado * max(Monto_Total) / max(Acumulado)), 
+             color = "red", size = 2) +
+  scale_y_continuous(
+    name = "Monto por Proveedor (S/.)",
+    labels = comma,
+    sec.axis = sec_axis(
+      ~ . / max(pareto$Monto_Total) * 100, 
+      name = "Porcentaje Acumulado (%)",
+      labels = function(x) paste0(round(x, 1), "%")
+    )
+  ) +
+  labs(
+    title = "Curva de Pareto de Proveedores",
+    x = "Proveedores (ordenados por monto)",
+    caption = "Las barras muestran el monto individual, la línea roja muestra el acumulado"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.title = element_text(size = 12)
+  )
+
+Pareto
+ggsave("Pareto.png", plot = Pareto,
+width = 8, height = 6, dpi = 300)
+
+```
+
+```{r}
+
+proveedores <- datos %>%
+  group_by(Nombre_Corto) %>%
+  summarise(
+    Ordenes = n(),
+    Monto_Total = sum(Monto_limpio)
+  ) %>%
+  arrange(desc(Ordenes))
+
+Proveedores = ggplot(proveedores %>% filter(Ordenes > 1), 
+       aes(x = reorder(Nombre_Corto, Ordenes), y = Ordenes, fill = Ordenes)) +
+  geom_col() +
+  geom_text(aes(label = paste0(Ordenes, " ord. | S/ ", comma(round(Monto_Total,0)))),
+            hjust = -0.1, size = 3.2) +
+  coord_flip() +
+  labs(title = "Proveedores con más de una orden en el mes",
+       x = "Proveedor", y = "Cantidad de Órdenes") +
+  scale_fill_gradient(low = "lightblue", high = "darkblue") +
+  scale_y_continuous(expand = expansion(mult = c(0,0.15))) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    axis.text.y = element_text(size = 9),
+    plot.margin = margin(5.5, 15, 5.5, 5.5, "pt")
+  )
+
+Proveedores
+ggsave("Proveedores.png", plot = Proveedores,
+width = 8, height = 6, dpi = 300)
+```
+
+```{r}
+# Clasificación por tipo de RUC
+datos <- datos %>%
+  mutate(Tipo_Proveedor = case_when(
+    str_starts(RUC, "10") ~ "Persona Natural",
+    str_starts(RUC, "20") ~ "Persona Jurídica",
+    TRUE ~ "Otro"
+  ))
+
+# Distribución de montos por tipo de proveedor
+total_general <- sum(datos$Monto_limpio)
+
+dist_tipo <- datos %>%
+  group_by(Tipo_Proveedor) %>%
+  summarise(Monto_Total = sum(Monto_limpio)) %>%
+  mutate(
+    Porcentaje = Monto_Total / total_general * 100,
+    Etiqueta = paste0("S/ ", comma(round(Monto_Total,0)), 
+                      " (", round(Porcentaje,1), "%)")
+  )
+
+
+# Gráfico circular mejorado con montos y porcentajes
+Tipo_Prov = ggplot(dist_tipo, aes(x = "", y = Monto_Total, fill = Tipo_Proveedor)) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar("y") +
+  geom_text(aes(label = Etiqueta), 
+            position = position_stack(vjust = 0.5),
+            color = "white", fontface = "bold", size = 4.2) +
+  labs(title = "Distribución del Gasto por Tipo de Proveedor",
+       fill = "Tipo de Proveedor") +
+  scale_fill_manual(values = c("Persona Natural" = "#3498db", 
+                               "Persona Jurídica" = "#e74c3c", 
+                               "Otro" = "#95a5a6")) +
+  theme_void() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+    legend.position = "bottom",
+    legend.title = element_text(face = "bold")
+  )
+
+Tipo_Prov
+ggsave("Tipo_Prov.png", plot = Tipo_Prov,
+width = 8, height = 6, dpi = 300)
+
+```
+
+```{r}
+# Órdenes por día (filtrando fechas válidas)
+ordenes_por_dia <- datos %>%
+  filter(!is.na(Fecha_Emision)) %>%  # Eliminar fechas nulas
+  group_by(Fecha_Emision) %>%
+  summarise(
+    Ordenes = n(),
+    Monto_Total = sum(Monto_limpio)
+  ) %>%
+  arrange(Fecha_Emision)  # Ordenar por fecha
+
+# Calcular factor de escalado dinámico
+factor_escala <- max(ordenes_por_dia$Ordenes) / max(ordenes_por_dia$Monto_Total)
+
+# Gráfico combinado: barras para cantidad, línea para monto
+Ordenes_dia = ggplot(ordenes_por_dia, aes(x = Fecha_Emision)) +
+  geom_col(aes(y = Ordenes), fill = "steelblue", alpha = 0.7) +
+  geom_line(aes(y = Monto_Total * factor_escala), color = "red", linewidth = 1) +
+  geom_point(aes(y = Monto_Total * factor_escala), color = "red", size = 2) +
+  scale_x_date(date_breaks = "1 week", date_labels = "%d/%m") +  # Formato de fechas
+  scale_y_continuous(
+    name = "Número de Órdenes",
+    sec.axis = sec_axis(
+      ~ . / factor_escala, 
+      name = "Monto Total (S/.)", 
+      labels = function(x) paste0("S/. ", comma(x))
+    )
+  ) +
+  labs(
+    title = "Órdenes y Monto Total por Día",
+    subtitle = "Barras azules: cantidad de órdenes | Línea roja: monto total",
+    x = "Fecha de Emisión",
+    caption = "Nota: Los dos ejes tienen escalas diferentes"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    plot.subtitle = element_text(size = 11, color = "gray60"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  )
+
+Ordenes_dia
+ggsave("Ordenes_dia.png", plot = Ordenes_dia,
+width = 8, height = 6, dpi = 300)
+```
+
+```{r}
+# Crear semana del mes (con filtro de fechas válidas)
+datos <- datos %>%
+  filter(!is.na(Fecha_Emision)) %>%  # Filtrar fechas nulas
+  mutate(Semana = paste0("Semana ", ceiling(day(Fecha_Emision) / 7)))
+
+# Resumen por semana
+resumen_semana <- datos %>%
+  group_by(Semana) %>%
+  summarise(
+    Ordenes = n(),
+    Monto_Total = sum(Monto_limpio)
+  ) %>%
+  # Ordenar semanas correctamente
+  mutate(Semana_num = as.numeric(str_extract(Semana, "\\d+"))) %>%
+  arrange(Semana_num) %>%
+  select(-Semana_num)
+
+print(resumen_semana)
+
+
+Total_Semana = ggplot(resumen_semana, aes(x = factor(Semana, levels = paste0("Semana ", 1:5)), 
+                           y = Monto_Total, fill = Semana)) +
+  geom_col(alpha = 0.8) +
+  geom_text(aes(label = paste0("S/. ", comma(Monto_Total))), 
+            vjust = -0.3, fontface = "bold", size = 3.5) +
+  geom_text(aes(label = paste0("(", Ordenes, " órdenes)")), 
+            vjust = 1.5, color = "white", fontface = "bold", size = 3) +
+  labs(title = "Monto Total por Semana",
+       subtitle = "Muestra monto total y cantidad de órdenes por semana",
+       x = "Semana", y = "Monto Total (S/.)") +
+  scale_y_continuous(labels = function(x) paste0("S/. ", comma(x)),
+                    expand = expansion(mult = c(0, 0.1))) +  # Más espacio arriba para etiquetas
+  scale_fill_brewer(type = "qual", palette = "Set2") +  # Colores más atractivos
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(size = 14, face = "bold"),
+    plot.subtitle = element_text(size = 11, color = "gray60"),
+    axis.text.x = element_text(size = 11),
+    axis.title = element_text(size = 12)
+  )
+
+Total_Semana
+ggsave("Total_Semana.png", plot = Total_Semana,
+width = 8, height = 6, dpi = 300)
+```
+
+```{r}
+# Calcular diferencia en días (con filtros y validaciones)
+datos <- datos %>%
+  filter(!is.na(Fecha_Emision) & !is.na(Fecha_Compromiso)) %>%  # Filtrar fechas nulas
+  mutate(Dias_Procesamiento = as.numeric(difftime(Fecha_Compromiso, Fecha_Emision, units = "days"))) %>%
+  # Filtrar valores extremos o negativos (opcional, según tu contexto)
+  filter(Dias_Procesamiento >= 0 & Dias_Procesamiento <= 365)  # Máximo 1 año
+
+
+# Histograma mejorado
+Proceso_entre_D_S = ggplot(datos, aes(x = Dias_Procesamiento)) +
+  geom_histogram(binwidth = 1, fill = "orange", color = "black", alpha = 0.7) +
+  geom_vline(aes(xintercept = mean(Dias_Procesamiento, na.rm = TRUE)), 
+             color = "red", linetype = "dashed", linewidth = 1) +
+  geom_vline(aes(xintercept = median(Dias_Procesamiento, na.rm = TRUE)), 
+             color = "blue", linetype = "dashed", linewidth = 1) +
+  labs(
+    title = "Distribución del Tiempo de Procesamiento de Órdenes",
+    subtitle = "Línea roja: promedio | Línea azul: mediana",
+    x = "Días entre Emisión y Compromiso", 
+    y = "Cantidad de Órdenes",
+    caption = paste0("n = ", nrow(datos), " órdenes con fechas válidas")
+  ) +
+  scale_x_continuous(breaks = seq(0, max(datos$Dias_Procesamiento, na.rm = TRUE), by = 5)) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    plot.subtitle = element_text(size = 11, color = "gray60"),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+Proceso_entre_D_S
+ggsave("Proceso_entre_D_S.png", plot = Proceso_entre_D_S,
+width = 8, height = 6, dpi = 300)
+```
+
+```{r}
+# Scatterplot monto vs tiempo
+Monto_Tiempo = ggplot(datos, aes(x = Dias_Procesamiento, y = Monto_limpio)) +
+  geom_jitter(alpha = 0.6, color = "steelblue") +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +
+  labs(title = "Relación entre Tiempo de Procesamiento y Monto",
+       x = "Días de Procesamiento", y = "Monto (S/.)") +
+  scale_y_continuous(labels = comma) +
+  theme_minimal()
+
+Monto_Tiempo
+ggsave("Monto_Tiempo.png", plot = Monto_Tiempo,
+width = 8, height = 6, dpi = 300)
+```
+
+```{r}
+# Primero calcular el total de datos válidos
+datos_validos <- datos %>% 
+  filter(!is.na(Estado_Registro) & Estado_Registro != "")
+
+total_ordenes <- nrow(datos_validos)
+
+cumplimiento <- datos_validos %>%
+  mutate(
+    Registro_Oportuno = ifelse(Estado_Registro == "Registrado dentro de plazo", "Sí", "No")
+  ) %>%
+  group_by(Registro_Oportuno) %>%
+  summarise(Cantidad = n()) %>%
+  mutate(Porcentaje = Cantidad / total_ordenes * 100)  # Usar total_ordenes, no nrow(datos)
+
+
+Ordenes_validas = ggplot(cumplimiento, aes(x = "", y = Porcentaje, fill = Registro_Oportuno)) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar("y") +
+  geom_text(aes(label = paste0(round(Porcentaje, 1), "%\n(", Cantidad, " órdenes)")),
+            position = position_stack(vjust = 0.5),
+            color = "white", fontface = "bold", size = 4) +
+  labs(
+    title = "Cumplimiento de Plazos de Registro de Órdenes",
+    subtitle = paste0("Total analizado: ", total_ordenes, " órdenes"),
+    fill = "Registro Oportuno"
+  ) +
+  scale_fill_manual(
+    values = c("No" = "#e74c3c", "Sí" = "#27ae60"),  # Rojo para No, Verde para Sí
+    labels = c("No" = "Fuera de Plazo", "Sí" = "Dentro de Plazo")
+  ) +
+  theme_void() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 11, color = "gray60", hjust = 0.5),
+    legend.position = "bottom",
+    legend.title = element_text(face = "bold"),
+    legend.text = element_text(size = 11)
+  )
+
+Ordenes_validas
+ggsave("Ordenes_validas.png", plot = Ordenes_validas,
+width = 8, height = 6, dpi = 300)
+
+```
+
+```{r}
+
+
+# Filtrar anuladas
+anuladas <- datos %>% filter(Estado == "Anulada")
+
+# Estadísticas básicas
+total_ordenes <- nrow(datos)
+total_anuladas <- nrow(anuladas)
+porcentaje_anuladas <- round((total_anuladas / total_ordenes) * 100, 2)
+
+    # Gráfico 2: Cantidad por tipo (si hay variedad)
+    if(nrow(anuladas) > 1) {
+      p2 <- ggplot(anuladas, aes(x = reorder(Tipo_Orden, Cantidad), 
+                                         y = Cantidad, fill = Tipo_Orden)) +
+        geom_col(alpha = 0.8) +
+        geom_text(aes(label = Cantidad), hjust = -0.1, fontface = "bold") +
+        coord_flip() +
+        labs(title = "Cantidad de Órdenes Anuladas por Tipo",
+             x = "Tipo de Orden", y = "Cantidad de Órdenes") +
+        scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+        theme_minimal() +
+        theme(legend.position = "none",
+              plot.title = element_text(face = "bold"))
+      
+      print(p2)
+    } else if(total_anuladas > 0) {
+    # Gráfico simple para pocos casos
+    Anuladas1= ggplot(anuladas, aes(x = Tipo_Orden, y = Monto_limpio, fill = Tipo_Orden)) +
+      geom_col(alpha = 0.8) +
+      geom_text(aes(label = paste0("S/. ", comma(Monto_limpio))), 
+                vjust = -0.3, fontface = "bold") +
+      labs(title = paste0("Órdenes Anuladas (", total_anuladas, " casos)"),
+           x = "Tipo de Orden", y = "Monto (S/.)") +
+      scale_y_continuous(labels = function(x) paste0("S/. ", comma(x)),
+                        expand = expansion(mult = c(0, 0.15))) +
+      theme_minimal() +
+      theme(legend.position = "none",
+            plot.title = element_text(face = "bold"))
+      
+      ggsave("Anuladas1.png", plot = Anuladas1,
+width = 8, height = 6, dpi = 300)
+      Anuladas1
+  }
+  
+```
+
+```{r}
+# Posible fraccionamiento en personas naturales
+fracc_naturales <- datos %>%
+  filter(Tipo_Proveedor == "Persona Natural") %>%
+  group_by(Razon_Social, RUC) %>%
+  summarise(
+    Ordenes = n(),
+    Monto_Total = sum(Monto_limpio),
+    Monto_Max = max(Monto_limpio),
+    .groups = "drop"
+  ) %>%
+  filter(Ordenes > 1 & Monto_Max < 39600) %>% # límite 8 UIT
+  arrange(desc(Monto_Total))
+
+print(fracc_naturales)
+
+# Gráfico mejorado: cantidad de órdenes + monto total
+if(nrow(fracc_naturales) > 0){
+  fracc_naturales = ggplot(fracc_naturales, 
+         aes(x = reorder(Razon_Social, Monto_Total), 
+             y = Monto_Total, fill = Ordenes)) +
+    geom_col() +
+    geom_text(aes(label = paste0("S/ ", comma(round(Monto_Total,0)),
+                                 " (", Ordenes, " ord.)")),
+              hjust = -0.1, size = 3.5) +
+    coord_flip() +
+    labs(title = "Personas Naturales con Múltiples Órdenes < 8 UIT (Posible Fraccionamiento)",
+         x = "Proveedor", y = "Monto Total (S/.)") +
+    scale_y_continuous(labels = comma, expand = expansion(mult = c(0,0.15))) +
+    theme_minimal() +
+    theme(legend.position = "none")
+  ggsave("fracc_naturales.png", plot = fracc_naturales,
+width = 8, height = 6, dpi = 300)
+  fracc_naturales
+}
+
+
+
+```
+
+```{r}
+# ANÁLISIS FORENSE DE PROVEEDORES
+# --------------------------------
+# Después de crear 'top5_proveedores' y 'pareto', agregue esto:
+
+# A) Cruzar con RUC y Dirección de Caminos
+proveedores_analisis <- datos %>%
+  group_by(Razon_Social, RUC) %>%
+  summarise(
+    Ordenes = n(),
+    Monto_Total = sum(Monto_limpio),
+    .groups = 'drop'
+  ) %>%
+  arrange(desc(Monto_Total))
+
+# BANDERA ROJA 1: ¿Algún proveedor principal es "HVIAL INGENIERIA TOTAL S.A.C."?
+# (La empresa del Director Regional, Imer Haro)
+print(proveedores_analisis %>% filter(str_detect(Razon_Social, "INGENIERIA")))
+
+# BANDERA ROJA 2: Proveedores con múltiples órdenes de bajo monto (posible fraccionamiento)
+# Esto ya lo tiene, pero hay que enfocarlo en obras.
+proveedores_sospechosos <- datos %>%
+  filter(Tipo_Contratacion %in% c("Contratación Directa", "Adjudicación Simplificada")) %>%
+  group_by(Razon_Social, RUC) %>%
+  summarise(
+    Ordenes = n(),
+    Monto_Total = sum(Monto_limpio),
+    Monto_Promedio = mean(Monto_limpio),
+    .groups = 'drop'
+  ) %>%
+  filter(Ordenes > 3 & Monto_Promedio < 8000) %>% # Ajuste umbral según el presupuesto
+  arrange(desc(Ordenes))
+
+print(proveedores_sospechosos)
+```

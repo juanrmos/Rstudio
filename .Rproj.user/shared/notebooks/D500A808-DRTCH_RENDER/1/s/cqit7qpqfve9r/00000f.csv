@@ -1,0 +1,4 @@
+"0","write.csv(score_integral, ""proveedores_alto_riesgo.csv"", row.names = FALSE)"
+"0","write.csv(ordenes_precio_anomalo, ""ordenes_sobreprecios.csv"", row.names = FALSE)"
+"0","write.csv(casos_fraccionamiento, ""casos_fraccionamiento.csv"", row.names = FALSE)"
+"0","write.csv(proveedores_nuevos, ""proveedores_nuevos_2023.csv"", row.names = FALSE)"

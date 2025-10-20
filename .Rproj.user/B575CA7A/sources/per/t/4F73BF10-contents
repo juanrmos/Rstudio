@@ -1,0 +1,1073 @@
+---
+title: "DRTC-H"
+---
+
+```{r}
+# Cargar librerías necesarias
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(stringr)
+library(scales)
+library(tidyr)
+library(forcats)
+library(ggrepel)
+library(patchwork)
+library(igraph)
+library(visNetwork)
+
+
+# 1. LIMPIEZA Y PREPARACIÓN DE DATOS
+
+
+# Cargar los datos
+datos <- read_excel("DRTC-H.xlsx")
+
+
+# Corregir nombres de columnas (quitar acentos y caracteres especiales)
+names(datos) <- c("N", "Entidad", "Tipo_Orden", "Numero_Orden", "Tipo_Contratacion",
+                  "Fecha_Emision", "Fecha_Compromiso", "Monto", "RUC", 
+                  "Razon_Social", "Estado", "Estado_Registro", "Observaciones")
+
+# Convertir fechas a formato Date
+datos <- datos %>%
+  mutate(
+    Fecha_Emision = as.Date(Fecha_Emision),
+    Fecha_Compromiso = as.Date(Fecha_Compromiso)
+  )
+
+
+# Convertir montos a numérico
+datos <- datos %>%
+  mutate(
+    Monto_limpio = as.numeric(gsub(",", "", gsub("^S/\\. ", "", Monto)))
+  )
+
+
+
+# Eliminar filas con montos nulos si las hay
+datos <- datos %>% filter(!is.na(Monto_limpio))
+
+
+datos <- datos %>%
+  mutate(Nombre_Corto = ifelse(nchar(Razon_Social) > 15, 
+                               paste0(substr(Razon_Social, 1, 12), "..."), 
+                               Razon_Social))
+datos <- datos %>%
+  mutate(Contratacion_Corto = ifelse(nchar(Tipo_Contratacion) > 20, 
+                               paste0(substr(Tipo_Contratacion, 1, 15), "..."), 
+                               Tipo_Contratacion))
+```
+
+```{r}
+# ========================================
+# 1. RESUMEN Y DESCRIPCIÓN DE DATOS
+# ========================================
+
+cat("\n=====================================\n")
+cat("1. RESUMEN ESTADÍSTICO GENERAL\n")
+cat("=====================================\n\n")
+
+# Estadísticas básicas de montos
+cat("ESTADÍSTICAS DE MONTOS:\n")
+cat("------------------------\n")
+summary_montos <- summary(datos$Monto_limpio)
+print(summary_montos)
+
+cat("\n\nESTADÍSTICAS ADICIONALES:\n")
+cat("------------------------\n")
+estadisticas_adicionales <- datos %>%
+  summarise(
+    Total_Ordenes = n(),
+    Total_Proveedores = n_distinct(RUC),
+    Total_Monto = sum(Monto_limpio),
+    Promedio_Orden = mean(Monto_limpio),
+    Mediana_Orden = median(Monto_limpio),
+    Desv_Estandar = sd(Monto_limpio),
+    Coef_Variacion = sd(Monto_limpio) / mean(Monto_limpio) * 100,
+    Monto_Min = min(Monto_limpio),
+    Monto_Max = max(Monto_limpio),
+    Q1 = quantile(Monto_limpio, 0.25),
+    Q3 = quantile(Monto_limpio, 0.75),
+    IQR = IQR(Monto_limpio)
+  )
+
+print(t(estadisticas_adicionales))
+```
+
+```{r}
+# A. Índice de Herfindahl-Hirschman (IHH) para medir concentración del mercado
+concentracion_proveedores <- datos %>%
+  group_by(RUC, Razon_Social) %>%
+  summarise(
+    Monto_Total = sum(Monto_limpio),
+    Num_Ordenes = n(),
+    Primera_Orden = min(Fecha_Emision),
+    Ultima_Orden = max(Fecha_Emision),
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    Participacion_Mercado = (Monto_Total / sum(Monto_Total)) * 100,
+    Participacion_Cuadrado = Participacion_Mercado^2
+  ) %>%
+  arrange(desc(Monto_Total))
+
+# Calcular IHH (>2500 = altamente concentrado, señal de alerta)
+IHH <- sum(concentracion_proveedores$Participacion_Cuadrado)
+print(paste("Índice Herfindahl-Hirschman:", round(IHH, 2)))
+```
+
+```{r}
+# B. Análisis de Pareto - 80/20
+concentracion_proveedores <- concentracion_proveedores %>%
+  mutate(
+    Acumulado_Monto = cumsum(Monto_Total),
+    Porcentaje_Acumulado = (Acumulado_Monto / sum(Monto_Total)) * 100,
+    Ranking = row_number()
+  )
+
+# ¿Cuántos proveedores concentran el 80% del gasto?
+proveedores_80 <- concentracion_proveedores %>%
+  filter(Porcentaje_Acumulado <= 80) %>%
+  nrow()
+
+print(paste("Proveedores que concentran 80% del gasto:", proveedores_80))
+
+```
+
+```{r}
+# Gráfico de concentración
+grafico_pareto <- ggplot(concentracion_proveedores %>% head(20)) +
+  geom_col(aes(x = reorder(substr(Razon_Social, 1, 20), -Monto_Total), 
+               y = Monto_Total/1000000), 
+           fill = "#e74c3c", alpha = 0.8) +
+  geom_line(aes(x = reorder(substr(Razon_Social, 1, 20), -Monto_Total), 
+                y = Porcentaje_Acumulado * max(Monto_Total/1000000) / 100,
+                group = 1), 
+            color = "#2c3e50", linewidth = 1.2) +
+  geom_point(aes(x = reorder(substr(Razon_Social, 1, 20), -Monto_Total), 
+                 y = Porcentaje_Acumulado * max(Monto_Total/1000000) / 100),
+             color = "#2c3e50", size = 3) +
+  scale_y_continuous(
+    name = "Monto Total (Millones S/)",
+    sec.axis = sec_axis(~./max(concentracion_proveedores$Monto_Total/1000000)*100, 
+                        name = "% Acumulado")
+  ) +
+  labs(title = "Análisis de Pareto - Concentración de Proveedores",
+       subtitle = paste("IHH =", round(IHH, 0), "- Mercado", 
+                       ifelse(IHH > 2500, "ALTAMENTE CONCENTRADO", "moderado")),
+       x = "Proveedor") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+grafico_pareto
+```
+
+```{r}
+proveedores_sospechosos <- concentracion_proveedores %>%
+  mutate(
+    # Bandera 1: Proveedor nuevo con contratos grandes
+    Nueva_Empresa = as.numeric(Primera_Orden - as.Date("2023-01-01")) < 365,
+    Contrato_Grande = Monto_Total > quantile(Monto_Total, 0.75),
+    
+    # Bandera 2: Solo una orden pero monto alto
+    Una_Sola_Orden = Num_Ordenes == 1,
+    Monto_Sospechoso = Monto_Total > quantile(Monto_Total, 0.90),
+    
+    # Bandera 3: Actividad concentrada en periodo corto
+    Dias_Activo = as.numeric(Ultima_Orden - Primera_Orden),
+    Actividad_Corta = Dias_Activo < 30 & Num_Ordenes > 1,
+    
+    # Score de riesgo
+    Score_Riesgo = Nueva_Empresa * 2 + Contrato_Grande + Una_Sola_Orden * 2 + 
+                   Monto_Sospechoso * 3 + Actividad_Corta * 2
+  ) %>%
+  filter(Score_Riesgo >= 3) %>%
+  select(RUC, Razon_Social, Monto_Total, Num_Ordenes, Primera_Orden, 
+         Dias_Activo, Score_Riesgo) %>%
+  arrange(desc(Score_Riesgo))
+
+print("PROVEEDORES DE ALTO RIESGO (Posibles empresas fantasma):")
+print(head(proveedores_sospechosos, 10))
+```
+
+```{r}
+# Detectar órdenes fraccionadas (mismo proveedor, fechas cercanas, montos similares)
+fraccionamiento <- datos %>%
+  arrange(RUC, Fecha_Emision) %>%
+  group_by(RUC) %>%
+  mutate(
+    Dias_Entre_Ordenes = as.numeric(Fecha_Emision - lag(Fecha_Emision)),
+    Monto_Anterior = lag(Monto_limpio),
+    Diferencia_Monto = abs(Monto_limpio - lag(Monto_limpio)),
+    
+    # Detectar si es posible fraccionamiento
+    Posible_Fraccionamiento = Dias_Entre_Ordenes <= 7 & 
+                              Diferencia_Monto < (Monto_limpio * 0.2) &
+                              !is.na(Dias_Entre_Ordenes)
+  ) %>%
+  filter(Posible_Fraccionamiento == TRUE)
+
+casos_fraccionamiento <- fraccionamiento %>%
+  group_by(RUC, Razon_Social) %>%
+  summarise(
+    Casos_Detectados = n(),
+    Monto_Total_Fraccionado = sum(Monto_limpio),
+    .groups = 'drop'
+  ) %>%
+  arrange(desc(Casos_Detectados))
+
+print("POSIBLES CASOS DE FRACCIONAMIENTO:")
+print(head(casos_fraccionamiento, 10))
+```
+
+```{r}
+# ========================================
+# 4. ANÁLISIS TEMPORAL DE ANOMALÍAS
+# ========================================
+
+# A. Detectar picos inusuales de gasto
+analisis_temporal <- datos %>%
+  mutate(
+    Año_Mes = floor_date(Fecha_Emision, "month")
+  ) %>%
+  group_by(Año_Mes) %>%
+  summarise(
+    Monto_Mensual = sum(Monto_limpio),
+    Num_Ordenes = n(),
+    Monto_Promedio_Orden = mean(Monto_limpio),
+    .groups = 'drop'
+  )
+
+# Calcular límites de control estadístico (3 sigmas)
+media_mensual <- mean(analisis_temporal$Monto_Mensual)
+sd_mensual <- sd(analisis_temporal$Monto_Mensual)
+limite_superior <- media_mensual + 3 * sd_mensual
+
+meses_anomalos <- analisis_temporal %>%
+  filter(Monto_Mensual > limite_superior) %>%
+  mutate(
+    Desviacion_Estandar = (Monto_Mensual - media_mensual) / sd_mensual
+  )
+
+print("MESES CON GASTOS ANÓMALOS (>3 sigmas):")
+print(meses_anomalos)
+
+```
+
+```{r}
+# B. Análisis de estacionalidad sospechosa
+datos_con_periodo <- datos %>%
+  mutate(
+    Mes = month(Fecha_Emision),
+    Trimestre = quarter(Fecha_Emision),
+    Año = year(Fecha_Emision)
+  )
+
+# Detectar si hay concentración en fin de año (típico en malversación)
+gasto_fin_año <- datos_con_periodo %>%
+  filter(Mes %in% c(11,12)) %>%
+  group_by(Año) %>%
+  summarise(Monto_Fin_Año = sum(Monto_limpio))
+
+gasto_total_anual <- datos_con_periodo %>%
+  group_by(Año) %>%
+  summarise(Monto_Total_Año = sum(Monto_limpio))
+
+concentracion_fin_año <- gasto_fin_año %>%
+  left_join(gasto_total_anual, by = "Año") %>%
+  mutate(
+    Porcentaje_Fin_Año = (Monto_Fin_Año / Monto_Total_Año) * 100
+  )
+
+print("CONCENTRACIÓN DE GASTO EN FIN DE AÑO:")
+print(concentracion_fin_año)
+```
+
+```{r}
+# ========================================
+# 5. ANÁLISIS DE REDES Y COLUSIÓN
+# ========================================
+
+# Crear matriz de co-ocurrencia temporal
+ventana_dias <- 30  # Ventana de tiempo para detectar co-ocurrencias
+
+coocurrencias <- datos %>%
+  select(RUC, Fecha_Emision, Monto_limpio) %>%
+  cross_join(datos %>% select(RUC2 = RUC, Fecha2 = Fecha_Emision)) %>%
+  filter(
+    RUC != RUC2,
+    abs(as.numeric(Fecha_Emision - Fecha2)) <= ventana_dias
+  ) %>%
+  group_by(RUC, RUC2) %>%
+  summarise(
+    Veces_Juntos = n(),
+    .groups = 'drop'
+  ) %>%
+  filter(Veces_Juntos >= 3)  # Al menos 3 co-ocurrencias
+
+# Identificar clusters de proveedores
+if(nrow(coocurrencias) > 0) {
+  grafo <- graph_from_data_frame(coocurrencias, directed = FALSE)
+  comunidades <- cluster_louvain(grafo)
+  
+  clusters_sospechosos <- data.frame(
+    RUC = names(membership(comunidades)),
+    Cluster = membership(comunidades)
+  ) %>%
+    group_by(Cluster) %>%
+    summarise(
+      Miembros = n(),
+      RUCs = paste(RUC, collapse = ", ")
+    ) %>%
+    filter(Miembros >= 3)
+  
+  print("POSIBLES CARTELES (3+ proveedores relacionados):")
+  print(clusters_sospechosos)
+}
+```
+
+```{r}
+# ========================================
+# 6. ANÁLISIS DE PRECIOS ANÓMALOS
+# ========================================
+
+# Agrupar por tipo de contratación para comparar precios
+analisis_precios <- datos %>%
+  group_by(Tipo_Contratacion) %>%
+  mutate(
+    Q1 = quantile(Monto_limpio, 0.25),
+    Q3 = quantile(Monto_limpio, 0.75),
+    IQR = Q3 - Q1,
+    Limite_Superior = Q3 + 1.5 * IQR,
+    Limite_Inferior = Q1 - 1.5 * IQR,
+    Es_Outlier = Monto_limpio > Limite_Superior | Monto_limpio < Limite_Inferior
+  )
+
+ordenes_precio_anomalo <- analisis_precios %>%
+  filter(Es_Outlier == TRUE) %>%
+  select(Numero_Orden, RUC, Razon_Social, Tipo_Contratacion, 
+         Fecha_Emision, Monto_limpio, Limite_Superior) %>%
+  mutate(
+    Sobreprecio_Porcentaje = ((Monto_limpio - Limite_Superior) / Limite_Superior) * 100
+  ) %>%
+  filter(Sobreprecio_Porcentaje > 0) %>%
+  arrange(desc(Sobreprecio_Porcentaje))
+
+print("ÓRDENES CON SOBREPRECIOS DETECTADOS:")
+print(head(ordenes_precio_anomalo, 15))
+
+top_sobreprecios <- ordenes_precio_anomalo %>%
+  arrange(desc(Sobreprecio_Porcentaje)) %>%
+  head(5) %>%
+  select(Numero_Orden, RUC, Razon_Social, Tipo_Contratacion,
+         Fecha_Emision, Monto_limpio, Limite_Superior, Sobreprecio_Porcentaje)
+
+# Mostrar en consola
+print(top_sobreprecios)
+```
+
+```{r}
+# ========================================
+# 7. ANÁLISIS DE CAMBIO DE GESTIÓN
+# ========================================
+
+# Comparar patrones antes y después del cambio de gestión (2023)
+antes_cambio <- datos %>%
+  filter(Fecha_Emision < as.Date("2023-01-01"))
+
+despues_cambio <- datos %>%
+  filter(Fecha_Emision >= as.Date("2022-01-01"))
+
+# Proveedores nuevos post-cambio
+proveedores_nuevos <- despues_cambio %>%
+  filter(!(RUC %in% antes_cambio$RUC)) %>%
+  group_by(RUC, Razon_Social) %>%
+  summarise(
+    Monto_Total = sum(Monto_limpio),
+    Num_Ordenes = n(),
+    Primera_Aparicion = min(Fecha_Emision),
+    .groups = 'drop'
+  ) %>%
+  arrange(desc(Monto_Total))
+
+print("PROVEEDORES NUEVOS POST-CAMBIO DE GESTIÓN (Top 10):")
+print(head(proveedores_nuevos, 10))
+```
+
+```{r}
+# ========================================
+# 8. GENERACIÓN DE SCORE INTEGRAL DE RIESGO
+# ========================================
+
+
+score_integral <- concentracion_proveedores %>%
+  left_join(
+    casos_fraccionamiento %>% select(RUC, Casos_Fraccionamiento = Casos_Detectados),
+    by = "RUC"
+  ) %>%
+  left_join(
+    proveedores_nuevos %>% select(RUC, Es_Nuevo_2023 = Primera_Aparicion),
+    by = "RUC"
+  ) %>%
+  mutate(
+    Casos_Fraccionamiento = replace_na(Casos_Fraccionamiento, 0),
+    Es_Nuevo_2023 = !is.na(Es_Nuevo_2023),
+    
+    # Calcular score de riesgo integral
+    Score_Concentracion = ifelse(Participacion_Mercado > 5, 3,
+                                 ifelse(Participacion_Mercado > 2, 2,
+                                       ifelse(Participacion_Mercado > 1, 1, 0))),
+    Score_Fraccionamiento = ifelse(Casos_Fraccionamiento > 5, 3,
+                                   ifelse(Casos_Fraccionamiento > 2, 2,
+                                         ifelse(Casos_Fraccionamiento > 0, 1, 0))),
+    Score_Nuevo = Es_Nuevo_2023 * 2,
+    Score_Una_Orden = (Num_Ordenes == 1 & Monto_Total > quantile(Monto_Total, 0.75)) * 3,
+    
+    SCORE_RIESGO_TOTAL = Score_Concentracion + Score_Fraccionamiento + 
+                         Score_Nuevo + Score_Una_Orden
+  ) %>%
+  filter(SCORE_RIESGO_TOTAL >= 3) %>%
+  select(RUC, Razon_Social, Monto_Total, Num_Ordenes, Participacion_Mercado,
+         Casos_Fraccionamiento, Es_Nuevo_2023, SCORE_RIESGO_TOTAL) %>%
+  arrange(desc(SCORE_RIESGO_TOTAL), desc(Monto_Total))
+
+
+print(head(score_integral, 20))
+
+```
+
+```{r}
+# ========================================
+# 9. VISUALIZACIONES CLAVE
+# ========================================
+
+# A. Timeline de anomalías
+timeline_anomalias <- ggplot(analisis_temporal, aes(x = Año_Mes, y = Monto_Mensual/1000000)) +
+  geom_line(color = "#34495e", linewidth = 1) +
+  geom_point(data = meses_anomalos, 
+            aes(x = Año_Mes, y = Monto_Mensual/1000000),
+            color = "red", size = 4) +
+  geom_hline(yintercept = limite_superior/1000000, 
+            linetype = "dashed", color = "red", alpha = 0.5) +
+  geom_vline(xintercept = as.Date("2023-01-01"), 
+            linetype = "dashed", color = "blue", alpha = 0.5) +
+  annotate("text", x = as.Date("2023-01-01"), y = max(analisis_temporal$Monto_Mensual/1000000),
+          label = "Cambio de Gestión", angle = 90, vjust = -0.5, color = "blue") +
+  labs(title = "Timeline de Gastos con Detección de Anomalías",
+       subtitle = "Línea roja = Límite de 3 sigmas | Puntos rojos = Meses anómalos",
+       x = "Mes", y = "Monto (Millones S/)") +
+  theme_minimal()
+
+timeline_anomalias
+```
+
+```{r}
+# B. Mapa de calor de riesgo por mes y tipo
+mapa_calor <- datos_con_periodo %>%
+  group_by(Año, Mes, Contratacion_Corto) %>%
+  summarise(
+    Monto_Total = sum(Monto_limpio)/1000000,
+    .groups = 'drop'
+  ) %>%
+  ggplot(aes(x = factor(Mes), y = Contratacion_Corto, fill = Monto_Total)) +
+  geom_tile() +
+  facet_wrap(~Año) +
+  scale_fill_gradient2(low = "white", mid = "orange", high = "red",
+                       midpoint = median(datos_con_periodo$Monto_limpio/1000000)) +
+  labs(title = "Mapa de Calor: Concentración de Gastos",
+       x = "Mes", y = "Tipo de Contratación",
+       fill = "Monto\n(Millones S/)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+mapa_calor
+```
+
+```{r}
+# Clasificación por tipo de proveedor
+datos <- datos %>%
+  mutate(Tipo_Proveedor = case_when(
+    str_starts(RUC, "10") ~ "Persona Natural",
+    str_starts(RUC, "20") ~ "Persona Jurídica",
+    TRUE ~ "Otro"
+  ))
+
+# Tabla de frecuencias por tipo de proveedor
+cat("\n\nTABLA DE FRECUENCIAS POR TIPO DE PROVEEDOR:\n")
+cat("-------------------------------------------\n")
+tabla_tipo_proveedor <- datos %>%
+  group_by(Tipo_Proveedor) %>%
+  summarise(
+    Num_Ordenes = n(),
+    Porcentaje_Ordenes = n() / nrow(datos) * 100,
+    Monto_Total = sum(Monto_limpio),
+    Porcentaje_Monto = sum(Monto_limpio) / sum(datos$Monto_limpio) * 100,
+    Monto_Promedio = mean(Monto_limpio),
+    Num_Proveedores_Unicos = n_distinct(RUC)
+  ) %>%
+  mutate(across(where(is.numeric), ~round(., 2)))
+
+print(tabla_tipo_proveedor)
+```
+
+```{r}
+# Distribución temporal
+cat("\n\nDISTRIBUCIÓN TEMPORAL:\n")
+cat("----------------------\n")
+rango_fechas <- datos %>%
+  summarise(
+    Fecha_Inicio = min(Fecha_Emision),
+    Fecha_Fin = max(Fecha_Emision),
+    Dias_Totales = as.numeric(max(Fecha_Emision) - min(Fecha_Emision)),
+    Años_Completos = n_distinct(year(Fecha_Emision))
+  )
+print(rango_fechas)
+
+datos <- datos %>%
+  mutate(Año = year(Fecha_Emision))
+
+# Análisis por año
+comparacion_anual <- datos %>%
+  group_by(Año) %>%
+  summarise(
+    Num_Ordenes = n(),
+    Monto_Total = sum(Monto_limpio),
+    Monto_Promedio = mean(Monto_limpio),
+    Mediana_Monto = median(Monto_limpio),
+    Desv_Estandar = sd(Monto_limpio),
+    Proveedores_Unicos = n_distinct(RUC),
+    Tipos_Contratacion = n_distinct(Tipo_Contratacion),
+    Ordenes_Por_Proveedor = n() / n_distinct(RUC),
+    Monto_Max = max(Monto_limpio),
+    Monto_Min = min(Monto_limpio)
+  ) %>%
+  arrange(Año)
+
+print(comparacion_anual)
+```
+
+```{r}
+# Calcular tasas de crecimiento
+comparacion_anual <- comparacion_anual %>%
+  mutate(
+    Crecimiento_Monto_Pct = (Monto_Total - lag(Monto_Total)) / lag(Monto_Total) * 100,
+    Crecimiento_Ordenes_Pct = (Num_Ordenes - lag(Num_Ordenes)) / lag(Num_Ordenes) * 100,
+    Crecimiento_Proveedores_Pct = (Proveedores_Unicos - lag(Proveedores_Unicos)) / lag(Proveedores_Unicos) * 100
+  )
+
+cat("\nTASAS DE CRECIMIENTO ANUAL:\n")
+cat("---------------------------\n")
+print(comparacion_anual %>% 
+      select(Año, Crecimiento_Monto_Pct, Crecimiento_Ordenes_Pct, Crecimiento_Proveedores_Pct))
+```
+
+```{r}
+# Análisis mensual para detectar picos
+analisis_mensual <- datos %>%
+  mutate(Año_Mes = floor_date(Fecha_Emision, "month")) %>%
+  group_by(Año_Mes) %>%
+  summarise(
+    Monto_Mensual = sum(Monto_limpio),
+    Num_Ordenes = n(),
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    Cambio_Mensual = (Monto_Mensual - lag(Monto_Mensual)) / lag(Monto_Mensual) * 100
+  )
+
+# Identificar picos y caídas (>50% cambio)
+picos_caidas <- analisis_mensual %>%
+  filter(abs(Cambio_Mensual) > 50, !is.na(Cambio_Mensual)) %>%
+  mutate(
+    Tipo = ifelse(Cambio_Mensual > 0, "PICO", "CAÍDA"),
+    Mes_Año = format(Año_Mes, "%b-%Y")
+  )
+print(picos_caidas %>% select(Mes_Año, Tipo, Cambio_Mensual, Monto_Mensual))
+```
+
+```{r}
+# Gráfico de evolución anual
+grafico_evolucion <- ggplot(comparacion_anual, aes(x = factor(Año))) +
+  geom_bar(aes(y = Monto_Total/1000000), stat = "identity", fill = "#3498db", alpha = 0.7) +
+  geom_line(aes(y = Num_Ordenes/10, group = 1), color = "#e74c3c", linewidth = 2) +
+  geom_point(aes(y = Num_Ordenes/10), color = "#e74c3c", linewidth = 3) +
+  scale_y_continuous(
+    name = "Monto Total (Millones S/)",
+    sec.axis = sec_axis(~.*10, name = "Número de Órdenes")
+  ) +
+  labs(
+    title = "Evolución Anual del Gasto y Órdenes",
+    subtitle = "Barras = Monto Total | Línea = Número de Órdenes",
+    x = "Año"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.text.x = element_text(size = 11)
+  )
+
+print(grafico_evolucion)
+
+```
+
+```{r}
+presupuesto_oficial <- data.frame(
+  Año = c(2023, 2024, 2025),
+  PIM = c(1999726251, 1961841636, 1905495522),  # Presupuesto Institucional Modificado
+  Ejecutado_Oficial = c(1839965157, 1866031196, 1232661856),  # Según reporte oficial
+  Porcentaje_Oficial = c(92.0, 95.1, 64.7)
+)
+
+# Calcular gasto real detectado
+gasto_real_detectado <- datos %>%
+  group_by(Año) %>%
+  summarise(
+    Gasto_Detectado = sum(Monto_limpio),
+    .groups = 'drop'
+  )
+
+analisis_presupuesto <- presupuesto_oficial %>%
+  left_join(gasto_real_detectado, by = "Año") %>%
+  mutate(
+    Gasto_Detectado = replace_na(Gasto_Detectado, 0),
+    Porcentaje_Detectado = (Gasto_Detectado / PIM) * 100,
+    Diferencia_Oficial_Detectado = Ejecutado_Oficial - Gasto_Detectado,
+    Porcentaje_No_Registrado = (Diferencia_Oficial_Detectado / Ejecutado_Oficial) * 100
+  )
+
+print(analisis_presupuesto)
+```
+
+```{r}
+datos_graf_presupuesto <- analisis_presupuesto %>%
+  select(Año, PIM, Ejecutado_Oficial, Gasto_Detectado) %>%
+  pivot_longer(cols = c(PIM, Ejecutado_Oficial, Gasto_Detectado), 
+               names_to = "Tipo", values_to = "Monto") %>%
+  mutate(Tipo = factor(Tipo, levels = c("PIM", "Ejecutado_Oficial", "Gasto_Detectado")))
+
+grafico_presupuesto <- ggplot(datos_graf_presupuesto, 
+                              aes(x = factor(Año), y = Monto/1000000, fill = Tipo)) +
+  geom_bar(stat = "identity", position = "dodge", alpha = 0.8) +
+  scale_fill_manual(values = c("PIM" = "#95a5a6", 
+                               "Ejecutado_Oficial" = "#3498db", 
+                               "Gasto_Detectado" = "#e74c3c"),
+                    labels = c("Presupuesto Modificado", "Ejecutado (Oficial)", "Detectado (Datos)")) +
+  labs(
+    title = "Comparación: Presupuesto vs. Ejecución vs. Detectado",
+    subtitle = "Diferencias significativas sugieren gastos no registrados o mal clasificados",
+    x = "Año",
+    y = "Monto (Millones S/)",
+    fill = "Tipo"
+  ) +
+  theme_minimal() +
+  geom_text(aes(label = round(Monto/1000000, 0)), 
+            position = position_dodge(width = 0.9), 
+            vjust = -0.5, size = 3)
+
+print(grafico_presupuesto)
+```
+
+```{r}
+# ========================================
+# 4. ANÁLISIS DE FRACCIONAMIENTO POR TIPO
+# ========================================
+
+cat("\n\n=====================================\n")
+cat("4. FRACCIONAMIENTO POR TIPO DE PROVEEDOR\n")
+cat("=====================================\n\n")
+
+# Detectar fraccionamiento por tipo de proveedor
+fraccionamiento_por_tipo <- datos %>%
+  arrange(RUC, Fecha_Emision) %>%
+  group_by(RUC) %>%
+  mutate(
+    Dias_Entre_Ordenes = as.numeric(Fecha_Emision - lag(Fecha_Emision)),
+    Diferencia_Monto = abs(Monto_limpio - lag(Monto_limpio)),
+    Posible_Fraccionamiento = Dias_Entre_Ordenes <= 7 & 
+                              Diferencia_Monto < (Monto_limpio * 0.2) &
+                              !is.na(Dias_Entre_Ordenes)
+  ) %>%
+  filter(Posible_Fraccionamiento == TRUE) %>%
+  left_join(datos %>% select(RUC, Tipo_Proveedor) %>% distinct(), by = "RUC") %>% 
+  mutate(Tipo_Proveedor = coalesce(Tipo_Proveedor.x, Tipo_Proveedor.y)) %>%
+select(-Tipo_Proveedor.x, -Tipo_Proveedor.y)
+
+resumen_fraccionamiento <- fraccionamiento_por_tipo %>%
+  group_by(Tipo_Proveedor) %>%
+  summarise(
+    Casos_Fraccionamiento = n(),
+    Monto_Total_Fraccionado = sum(Monto_limpio),
+    Monto_Promedio_Fraccion = mean(Monto_limpio),
+    Mediana_Fraccion = median(Monto_limpio),
+    Proveedores_Involucrados = n_distinct(RUC),
+    Dias_Promedio_Entre_Ordenes = mean(Dias_Entre_Ordenes, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    Casos_Por_Proveedor = Casos_Fraccionamiento / Proveedores_Involucrados
+  )
+
+print(resumen_fraccionamiento)
+
+```
+
+```{r}
+# Patrones de fraccionamiento
+cat("\n\nPATRONES DE FRACCIONAMIENTO:\n")
+cat("-----------------------------\n")
+
+# Para personas naturales
+fraccion_naturales <- fraccionamiento_por_tipo %>%
+  filter(Tipo_Proveedor == "Persona Natural") %>%
+  group_by(RUC, Razon_Social) %>%
+  summarise(
+    Casos = n(),
+    Monto_Total = sum(Monto_limpio),
+    Dias_Promedio = mean(Dias_Entre_Ordenes),
+    .groups = 'drop'
+  ) %>%
+  arrange(desc(Casos)) %>%
+  head(10)
+
+cat("\nTop 10 Personas Naturales con Fraccionamiento:\n")
+print(fraccion_naturales)
+```
+
+```{r}
+# Para personas jurídicas
+fraccion_juridicas <- fraccionamiento_por_tipo %>%
+  filter(Tipo_Proveedor == "Persona Jurídica") %>%
+  group_by(RUC, Razon_Social) %>%
+  summarise(
+    Casos = n(),
+    Monto_Total = sum(Monto_limpio),
+    Dias_Promedio = mean(Dias_Entre_Ordenes),
+    .groups = 'drop'
+  ) %>%
+  arrange(desc(Casos)) %>%
+  head(10)
+
+cat("\nTop 10 Personas Jurídicas con Fraccionamiento:\n")
+print(fraccion_juridicas)
+
+```
+
+```{r}
+ggplot(datos, aes(x = Contratacion_Corto, y = Monto_limpio/1000, fill = Contratacion_Corto)) +
+  geom_boxplot(alpha = 0.7, outlier.color = "red") +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Distribución de Montos por Tipo de Contratación",
+       x = "Tipo de Contratación", y = "Monto (en miles de S/.)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none")
+
+```
+
+```{r}
+cat("\n\n=====================================\n")
+cat("5. ANÁLISIS DE RELACIONES ENTRE VARIABLES\n")
+cat("=====================================\n\n")
+
+# Análisis por tipo de contratación
+relacion_tipo_contratacion <- datos %>%
+  group_by(Tipo_Contratacion, Tipo_Proveedor) %>%
+  summarise(
+    Num_Ordenes = n(),
+    Monto_Total = sum(Monto_limpio),
+    Monto_Promedio = mean(Monto_limpio),
+    CV = sd(Monto_limpio) / mean(Monto_limpio),
+    .groups = 'drop'
+  ) %>%
+  arrange(desc(Monto_Total))
+
+cat("RELACIÓN TIPO CONTRATACIÓN - TIPO PROVEEDOR:\n")
+cat("--------------------------------------------\n")
+print(head(relacion_tipo_contratacion, 15))
+```
+
+```{r}
+datos_correlacion <- datos %>%
+  mutate(
+    Mes = month(Fecha_Emision),
+    Año = year(Fecha_Emision),
+    Trimestre = quarter(Fecha_Emision),
+    Es_Fin_Año = ifelse(Mes >= 11, 1, 0),
+    Es_Natural = ifelse(Tipo_Proveedor == "Persona Natural", 1, 0)
+  )
+
+# Calcular correlaciones
+correlaciones <- datos_correlacion %>%
+  select(Monto_limpio, Mes, Trimestre, Es_Fin_Año, Es_Natural) %>%
+  cor(use = "complete.obs")
+print(round(correlaciones, 3))
+```
+
+```{r}
+patrones_sospechosos <- datos %>%
+  filter(Tipo_Proveedor == "Persona Natural") %>%
+  group_by(RUC) %>%
+  summarise(
+    Num_Ordenes = n(),
+    Monto_Total = sum(Monto_limpio),
+    Tipos_Contratacion_Diferentes = n_distinct(Tipo_Contratacion),
+    .groups = 'drop'
+  ) %>%
+  filter(Tipos_Contratacion_Diferentes >= 3, Monto_Total > 100000) %>%
+  arrange(desc(Monto_Total))
+print(head(patrones_sospechosos, 10))
+```
+
+```{r}
+cat("\n\n=====================================\n")
+cat("6. DISTRIBUCIÓN DEL GASTO POR TIPO DE CONTRATACIÓN\n")
+cat("=====================================\n\n")
+
+# Distribución por año y tipo
+distribucion_tipo_año <- datos %>%
+  group_by(Año, Tipo_Contratacion) %>%
+  summarise(
+    Monto_Total = sum(Monto_limpio),
+    Num_Ordenes = n(),
+    .groups = 'drop'
+  ) %>%
+  group_by(Año) %>%
+  mutate(
+    Porcentaje_Monto = Monto_Total / sum(Monto_Total) * 100,
+    Porcentaje_Ordenes = Num_Ordenes / sum(Num_Ordenes) * 100
+  )
+
+# Tabla resumen
+tabla_distribucion <- distribucion_tipo_año %>%
+  select(Año, Tipo_Contratacion, Monto_Total, Porcentaje_Monto) %>%
+  arrange(Año, desc(Monto_Total)) %>%
+  group_by(Año) %>%
+  slice_head(n = 5)  # Top 5 por año
+
+print(tabla_distribucion)
+```
+
+```{r}
+graf_absolutos <- ggplot(distribucion_tipo_año, 
+                         aes(x = factor(Año), y = Monto_Total/1000000, 
+                             fill = Tipo_Contratacion)) +  # Eliminar reorder()
+  geom_bar(stat = "identity", position = "stack") +
+  labs(
+    title = "Distribución del Gasto por Tipo de Contratación (Montos Absolutos)",
+    x = "Año",
+    y = "Monto (Millones S/)",
+    fill = "Tipo de Contratación"
+  ) +
+  theme_minimal() +
+  scale_fill_brewer(palette = "Set3")
+
+print(graf_absolutos)
+```
+
+```{r}
+cambios_distribucion <- distribucion_tipo_año %>%
+  group_by(Tipo_Contratacion) %>%
+  arrange(Año) %>%
+  mutate(
+    Cambio_Porcentaje = Porcentaje_Monto - lag(Porcentaje_Monto)
+  ) %>%
+  filter(abs(Cambio_Porcentaje) > 5, !is.na(Cambio_Porcentaje))
+
+cat("\n\nCAMBIOS SIGNIFICATIVOS EN DISTRIBUCIÓN (>5 puntos porcentuales):\n")
+cat("----------------------------------------------------------------\n")
+print(cambios_distribucion %>% 
+      select(Tipo_Contratacion, Año, Porcentaje_Monto, Cambio_Porcentaje))
+
+```
+
+```{r}
+# ========================================
+# 7. RANKING DE PROVEEDORES RELEVANTES
+# ========================================
+
+cat("\n\n=====================================\n")
+cat("7. RANKING DE PROVEEDORES RELEVANTES\n")
+cat("=====================================\n\n")
+
+# Top 20 Personas Jurídicas
+top_juridicas <- datos %>%
+  filter(Tipo_Proveedor == "Persona Jurídica") %>%
+  group_by(RUC, Razon_Social) %>%
+  summarise(
+    Monto_Total = sum(Monto_limpio),
+    Num_Ordenes = n(),
+    Primera_Orden = min(Fecha_Emision),
+    Ultima_Orden = max(Fecha_Emision),
+    Tipos_Contratacion = n_distinct(Tipo_Contratacion),
+    .groups = 'drop'
+  ) %>%
+  # Agregar alertas
+  left_join(
+    casos_fraccionamiento %>% 
+      select(RUC, Casos_Fraccionamiento = Casos_Detectados),
+    by = "RUC"
+  ) %>%
+  left_join(
+    ordenes_precio_anomalo %>%
+      group_by(RUC) %>%
+      summarise(Ordenes_Sobreprecio = n(), .groups = 'drop'),
+    by = "RUC"
+  ) %>%
+  mutate(
+    Casos_Fraccionamiento = replace_na(Casos_Fraccionamiento, 0),
+    Ordenes_Sobreprecio = replace_na(Ordenes_Sobreprecio, 0),
+    Alertas_Totales = Casos_Fraccionamiento + Ordenes_Sobreprecio,
+    Es_Nuevo_2023 = Primera_Orden >= as.Date("2023-01-01")
+  ) %>%
+  arrange(desc(Monto_Total)) %>%
+  head(20)
+
+cat("TOP 20 PERSONAS JURÍDICAS:\n")
+cat("--------------------------\n")
+print(top_juridicas %>% 
+      select(RUC, Razon_Social, Monto_Total, Num_Ordenes, 
+             Alertas_Totales, Es_Nuevo_2023) %>%
+      mutate(Monto_Total = round(Monto_Total, 0)))
+
+# Top 20 Personas Naturales
+top_naturales <- datos %>%
+  filter(Tipo_Proveedor == "Persona Natural") %>%
+  group_by(RUC, Razon_Social) %>%
+  summarise(
+    Monto_Total = sum(Monto_limpio),
+    Num_Ordenes = n(),
+    Primera_Orden = min(Fecha_Emision),
+    Ultima_Orden = max(Fecha_Emision),
+    Tipos_Contratacion = n_distinct(Tipo_Contratacion),
+    .groups = 'drop'
+  ) %>%
+  # Agregar alertas
+  left_join(
+    casos_fraccionamiento %>% 
+      select(RUC, Casos_Fraccionamiento = Casos_Detectados),
+    by = "RUC"
+  ) %>%
+  left_join(
+    ordenes_precio_anomalo %>%
+      group_by(RUC) %>%
+      summarise(Ordenes_Sobreprecio = n(), .groups = 'drop'),
+    by = "RUC"
+  ) %>%
+  mutate(
+    Casos_Fraccionamiento = replace_na(Casos_Fraccionamiento, 0),
+    Ordenes_Sobreprecio = replace_na(Ordenes_Sobreprecio, 0),
+    Alertas_Totales = Casos_Fraccionamiento + Ordenes_Sobreprecio,
+    Es_Nuevo_2023 = Primera_Orden >= as.Date("2023-01-01")
+  ) %>%
+  arrange(desc(Monto_Total)) %>%
+  head(20)
+
+cat("\n\nTOP 20 PERSONAS NATURALES:\n")
+cat("--------------------------\n")
+print(top_naturales %>% 
+      select(RUC, Razon_Social, Monto_Total, Num_Ordenes, 
+             Alertas_Totales, Es_Nuevo_2023) %>%
+      mutate(Monto_Total = round(Monto_Total, 0)))
+
+# Proveedores con múltiples alertas
+multi_alertas <- rbind(
+  top_juridicas %>% mutate(Tipo = "Jurídica"),
+  top_naturales %>% mutate(Tipo = "Natural")
+) %>%
+  filter(Alertas_Totales >= 3) %>%
+  arrange(desc(Alertas_Totales), desc(Monto_Total))
+
+cat("\n\nPROVEEDORES CON MÚLTIPLES ALERTAS (>=3):\n")
+cat("----------------------------------------\n")
+print(multi_alertas %>% 
+      select(Tipo, RUC, Razon_Social, Monto_Total, 
+             Casos_Fraccionamiento, Ordenes_Sobreprecio, Alertas_Totales))
+
+```
+
+```{r}
+library(treemapify)
+
+concentracion_corto <- concentracion_proveedores %>% 
+  head(20) %>%
+  mutate(Nombre_Corto = ifelse(nchar(Razon_Social) > 25,
+                                paste0(substr(Razon_Social, 1, 22), "..."),
+                                Razon_Social))
+
+ggplot(concentracion_corto,
+       aes(area = Monto_Total, fill = Participacion_Mercado, label = Nombre_Corto)) +
+  geom_treemap() +
+  geom_treemap_text(colour = "white", place = "centre", grow = TRUE, 
+                    reflow = TRUE) +  # Agregar reflow
+  labs(title = "Top 20 Proveedores por Monto (Treemap)",
+       subtitle = "Área proporcional al monto total") +
+  scale_fill_gradient(low = "lightblue", high = "darkblue") +
+  theme_minimal()
+
+```
+
+```{r}
+ggplot(score_integral, aes(x = Num_Ordenes, y = Monto_Total/1000000,
+                           size = Participacion_Mercado, color = SCORE_RIESGO_TOTAL)) +
+  geom_point(alpha = 0.7) +
+  scale_size(range = c(3,12)) +
+  scale_color_gradient(low = "yellow", high = "red") +
+  labs(title = "Mapa de Riesgo de Proveedores",
+       x = "Número de Órdenes", y = "Monto Total (Millones S/)",
+       size = "% Participación en el mercado", color = "Score de Riesgo") +
+  theme_minimal()
+
+```
+
+```{r}
+serie_tiempo_contratacion <- datos %>%
+  mutate(Año_Mes = floor_date(Fecha_Emision, "month")) %>%
+  group_by(Año_Mes, Tipo_Contratacion) %>%
+  summarise(Monto_Mensual = sum(Monto_limpio), .groups = "drop")
+
+Tiempo_contrataciones = ggplot(serie_tiempo_contratacion, aes(x = Año_Mes, y = Monto_Mensual/1000000,
+                                      color = Tipo_Contratacion)) +
+  geom_line(linewidth = 1.2) +
+  labs(title = "Evolución Mensual del Gasto por Tipo de Contratación",
+       x = "Fecha", y = "Monto (Millones S/)") +
+  theme_minimal()
+
+ggsave("mi_grafico_largo.png", plot = Tiempo_contrataciones, width = 10, height = 8, units = "in", dpi = 300)
+```
+
+```{r}
+gasto_proveedor_anual <- datos %>%
+  group_by(Año, Tipo_Proveedor) %>%
+  summarise(Monto_Total = sum(Monto_limpio), .groups = "drop")
+
+ggplot(gasto_proveedor_anual, aes(x = factor(Año), y = Monto_Total/1000000,
+                                  fill = Tipo_Proveedor)) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(title = "Distribución del Gasto por Tipo de Proveedor",
+       x = "Año", y = "Monto (Millones S/)") +
+  scale_fill_manual(values = c("Persona Natural" = "#f39c12",
+                               "Persona Jurídica" = "#2980b9",
+                               "Otro" = "#7f8c8d")) +
+  theme_minimal()
+
+```
+
+```{r}
+cat(paste("✓ Total de órdenes analizadas:", nrow(datos), "\n"))
+cat(paste("✓ Periodo:", min(datos$Fecha_Emision), "a", max(datos$Fecha_Emision), "\n"))
+cat(paste("✓ Monto total:", format(sum(datos$Monto_limpio), big.mark = ","), "soles\n"))
+cat(paste("✓ Proveedores únicos:", n_distinct(datos$RUC), "\n\n"))
+
+cat("🔴 ALERTAS CRÍTICAS:\n")
+cat("-------------------\n")
+cat(paste("• Proveedores con fraccionamiento:", nrow(casos_fraccionamiento), "\n"))
+cat(paste("• Órdenes con sobreprecio:", nrow(ordenes_precio_anomalo), "\n"))
+cat(paste("• Sobreprecio máximo detectado:", 
+          round(max(ordenes_precio_anomalo$Sobreprecio_Porcentaje), 1), "%\n"))
+cat(paste("• Proveedores nuevos (2023+) con contratos:", nrow(proveedores_nuevos), "\n"))
+cat(paste("• Concentración fin de año promedio:", 
+          round(mean(concentracion_fin_año$Porcentaje_Fin_Año), 1), "%\n\n"))
+
+```

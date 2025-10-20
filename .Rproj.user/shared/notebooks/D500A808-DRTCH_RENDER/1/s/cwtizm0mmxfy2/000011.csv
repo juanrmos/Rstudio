@@ -1,0 +1,31 @@
+"0","cat(""\n\n=====================================\n"")"
+"1","
+
+=====================================
+"
+"0","cat(""5. ANÁLISIS DE RELACIONES ENTRE VARIABLES\n"")"
+"1","5. ANÁLISIS DE RELACIONES ENTRE VARIABLES
+"
+"0","cat(""=====================================\n\n"")"
+"1","=====================================
+
+"
+"0","# Análisis por tipo de contratación"
+"0","relacion_tipo_contratacion <- datos %>%"
+"0","  group_by(Tipo_Contratacion, Tipo_Proveedor) %>%"
+"0","  summarise("
+"0","    Num_Ordenes = n(),"
+"0","    Monto_Total = sum(Monto_limpio),"
+"0","    Monto_Promedio = mean(Monto_limpio),"
+"0","    CV = sd(Monto_limpio) / mean(Monto_limpio),"
+"0","    .groups = 'drop'"
+"0","  ) %>%"
+"0","  arrange(desc(Monto_Total))"
+"0",""
+"0","cat(""RELACIÓN TIPO CONTRATACIÓN - TIPO PROVEEDOR:\n"")"
+"1","RELACIÓN TIPO CONTRATACIÓN - TIPO PROVEEDOR:
+"
+"0","cat(""--------------------------------------------\n"")"
+"1","--------------------------------------------
+"
+"0","print(head(relacion_tipo_contratacion, 15))"
