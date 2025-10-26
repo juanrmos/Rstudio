@@ -516,3 +516,338 @@ proveedores_sospechosos <- datos %>%
 
 print(proveedores_sospechosos)
 ```
+
+
+```{r}
+# AGREGAR AL INICIO:
+# ========================================
+# MARCO CONCEPTUAL Y DEFINICIONES
+# ========================================
+
+cat("DEFINICIONES OPERACIONALES:\n")
+cat("---------------------------\n")
+cat("• Fraccionamiento: División artificial de contratos para evadir límites legales\n")
+cat("• IHH > 2500: Mercado altamente concentrado (posible colusión)\n")
+cat("• Empresa fantasma: RUC nuevo + contrato grande + actividad corta\n")
+cat("• Sobreprecio: Precio >150% del límite superior del IQR\n\n")
+
+# Agregar contexto legal
+normativa <- data.frame(
+  Ley = c("Ley 30225", "Ley 27444", "Ley 28716"),
+  Tema = c("Contrataciones del Estado", 
+           "Procedimiento Administrativo General",
+           "Ley de Control Interno"),
+  Umbral_Relevante = c("8 UIT para Adjudicación Simplificada",
+                       "N/A",
+                       "Auditoría obligatoria")
+)
+
+print(normativa)
+```
+
+
+```{r}
+library(tidytext)
+library(wordcloud)
+library(tm)
+
+# Si tienes campo de observaciones
+if("Observaciones" %in% names(datos)) {
+  
+  # Tokenización
+  palabras_observaciones <- datos %>%
+    filter(!is.na(Observaciones), Observaciones != "") %>%
+    unnest_tokens(word, Observaciones) %>%
+    anti_join(stop_words) %>%
+    count(word, sort = TRUE)
+  
+  # Nube de palabras
+  wordcloud(palabras_observaciones$word, 
+            palabras_observaciones$n,
+            max.words = 100,
+            colors = brewer.pal(8, "Dark2"))
+  
+  # Bigramas sospechosos
+  bigramas <- datos %>%
+    filter(!is.na(Observaciones)) %>%
+    unnest_tokens(bigram, Observaciones, token = "ngrams", n = 2) %>%
+    count(bigram, sort = TRUE) %>%
+    head(20)
+  
+  print(bigramas)
+}
+```
+
+```{r}
+library(igraph)
+library(ggraph)
+library(dplyr)
+library(lubridate)
+library(tidyr)
+library(ggplot2)
+library(scales)
+
+# ================================================
+# 1️⃣ Crear la red de proveedores con patrones similares
+# ================================================
+# Convertimos RUC a character desde el inicio para evitar incompatibilidades
+red_temporal <- datos %>%
+  mutate(RUC = as.character(RUC)) %>%
+  select(RUC, Fecha_Emision, Monto_limpio) %>%
+  mutate(Semana = floor_date(Fecha_Emision, "week")) %>%
+  group_by(RUC, Semana) %>%
+  summarise(Monto = sum(Monto_limpio, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = Semana, values_from = Monto, values_fill = 0)
+
+matriz_proveedores <- as.matrix(red_temporal[,-1])
+rownames(matriz_proveedores) <- red_temporal$RUC
+
+# Correlación entre patrones de gasto
+correlacion_proveedores <- cor(t(matriz_proveedores), use = "pairwise.complete.obs")
+
+# Crear red con correlaciones > 0.7
+adj_mat <- (correlacion_proveedores > 0.7) * correlacion_proveedores
+diag(adj_mat) <- 0
+red_sospechosa <- graph_from_adjacency_matrix(adj_mat, mode = "undirected", weighted = TRUE, diag = FALSE)
+
+# ================================================
+# 2️⃣ Calcular métricas y seleccionar el top 20
+# ================================================
+# Grado (número de conexiones)
+grados <- degree(red_sospechosa)
+
+# Fuerza total (suma de correlaciones)
+fuerza_total <- strength(red_sospechosa)
+
+# Crear data frame con métricas (asegurando character)
+metricas <- data.frame(
+  Proveedor = as.character(names(grados)),
+  Grado = as.integer(grados),
+  Fuerza = as.numeric(fuerza_total),
+  stringsAsFactors = FALSE
+) %>%
+  arrange(desc(Fuerza)) %>%
+  slice_head(n = 20)
+
+# ================================================
+# 3️⃣ Vincular nombres de proveedores (si existen)
+# ================================================
+# Detectar columna de nombre en 'datos'
+col_nombres <- intersect(names(datos), c("Nombre_Proveedor", "Razon_Social", "Proveedor_Nombre"))
+
+if (length(col_nombres) > 0) {
+  # Aseguramos que RUC sea character en la tabla de nombres
+  nombres_unicos <- datos %>%
+    mutate(RUC = as.character(RUC)) %>%
+    select(RUC, all_of(col_nombres[1])) %>%
+    distinct()
+  
+  # Convertir Proveedor a character antes de hacer join
+  metricas <- metricas %>%
+    mutate(Proveedor = as.character(Proveedor)) %>%
+    left_join(nombres_unicos, by = c("Proveedor" = "RUC")) %>%
+    mutate(
+      # Si el nombre viene NA, dejaremos solo el RUC
+      !!paste0("Etiqueta") := ifelse(
+        is.na(.[[col_nombres[1]]]),
+        paste0("(", Proveedor, ")"),
+        paste0(.[[col_nombres[1]]], "\n(", Proveedor, ")")
+      )
+    )
+} else {
+  metricas <- metricas %>%
+    mutate(Etiqueta = paste0("Proveedor ", row_number(), "\n(", Proveedor, ")"))
+}
+
+# ================================================
+# 4️⃣ Subgrafo con los top 20 y pasar atributos
+# ================================================
+# Aseguramos que los vértices a inducir existan en la red original
+v_presentes <- intersect(metricas$Proveedor, V(red_sospechosa)$name)
+sub_red <- induced_subgraph(red_sospechosa, vids = v_presentes)
+
+# Asignar la fuerza como atributo de vértice en el subgrafo (para usar en aes)
+V(sub_red)$Fuerza <- fuerza_total[V(sub_red)$name]
+# También asignar etiqueta (si metricas no tiene alguno por NA, crear fallback)
+labels_map <- metricas %>% filter(Proveedor %in% V(sub_red)$name) %>% select(Proveedor, Etiqueta)
+V(sub_red)$Etiqueta <- labels_map$Etiqueta[match(V(sub_red)$name, labels_map$Proveedor)]
+V(sub_red)$Etiqueta[is.na(V(sub_red)$Etiqueta)] <- paste0("(", V(sub_red)$name[is.na(V(sub_red)$Etiqueta)], ")")
+
+# ================================================
+# 5️⃣ Visualización elegante con ggraph (usa atributos del subgrafo)
+# ================================================
+set.seed(123)
+
+ggraph(sub_red, layout = "fr") +
+  geom_edge_link(aes(width = weight, alpha = weight), color = "#5DADE2") +
+  geom_node_point(aes(size = Fuerza), color = "#E74C3C") +
+  geom_node_text(aes(label = Etiqueta), repel = TRUE, size = 3, color = "black", fontface = "bold") +
+  scale_edge_width_continuous(range = c(0.2, 2), guide = "none") +
+  scale_size_continuous(range = c(4, 10)) +
+  theme_void() +
+  labs(
+    title = "🔥 Top 20 Proveedores con Patrones de Gasto Similares",
+    subtitle = "Tamaño del nodo = Fuerza total de correlación | Color de líneas = nivel de similitud",
+    caption = "Fuente: Análisis de correlación temporal entre proveedores"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, color = "#1A5276"),
+    plot.subtitle = element_text(size = 11, color = "#2E4053"),
+    plot.caption = element_text(size = 8, color = "#7F8C8D")
+  )
+
+# ================================================
+# 6️⃣ Mostrar tabla ordenada con los puntajes (incluye nombre si existe)
+# ================================================
+tabla_final <- metricas %>%
+  arrange(desc(Fuerza)) %>%
+  mutate(Rank = row_number()) %>%
+  select(Rank, everything())
+
+tabla_final
+
+
+```
+
+```{r}
+library(randomForest)
+library(caret)
+
+# Crear dataset para predecir órdenes sospechosas
+datos_modelo <- datos %>%
+  left_join(concentracion_proveedores, by = "RUC") %>%
+  mutate(
+    Es_Sospechoso = ifelse(
+      RUC %in% score_integral$RUC | 
+      RUC %in% casos_fraccionamiento$RUC, 
+      1, 0
+    ),
+    Mes = month(Fecha_Emision),
+    Es_Fin_Año = ifelse(Mes >= 11, 1, 0),
+    Dias_Desde_Inicio = as.numeric(Fecha_Emision - min(Fecha_Emision)),
+    Monto_Normalizado = scale(Monto_limpio)[,1]
+  ) %>%
+  filter(!is.na(Es_Sospechoso))
+
+# Entrenar modelo
+set.seed(123)
+modelo_rf <- randomForest(
+  factor(Es_Sospechoso) ~ Monto_Normalizado + Mes + Es_Fin_Año + 
+    Dias_Desde_Inicio + Participacion_Mercado,
+  data = datos_modelo,
+  ntree = 500,
+  importance = TRUE
+)
+
+# Importancia de variables
+varImpPlot(modelo_rf)
+print(importance(modelo_rf))
+```
+
+```{r}
+datos <- datos %>%
+  mutate(Año = lubridate::year(Fecha_Emision))
+
+```
+
+```{r}
+datos %>% 
+  group_by(Periodo = ifelse(Año < 2023, "Antes 2023", "Desde 2023")) %>% 
+  summarise(
+    Mediana = median(Monto_limpio, na.rm = TRUE),
+    Promedio = mean(Monto_limpio, na.rm = TRUE)
+  )
+
+```
+
+
+```{r}
+# NUEVO: Tests estadísticos
+library(stats)
+
+# Test de diferencia antes/después cambio de gestión
+wilcox.test(
+  datos %>% filter(Año < 2023) %>% pull(Monto_limpio),
+  datos %>% filter(Año >= 2023) %>% pull(Monto_limpio)
+)
+
+# Test de Benford para detectar manipulación de cifras
+library(benford.analysis)
+
+benford_test <- benford(datos$Monto_limpio, number.of.digits = 1)
+plot(benford_test)
+
+cat("\nTest de Benford - Desviación significativa indica manipulación de cifras\n")
+print(benford_test)
+```
+
+
+```{r}
+# AGREGAR AL FINAL:
+# ========================================
+# INFORME EJECUTIVO FINAL
+# ========================================
+
+cat("\n")
+cat("╔═══════════════════════════════════════════════════╗\n")
+cat("║   INFORME EJECUTIVO - ANÁLISIS DE CORRUPCIÓN    ║\n")
+cat("╚═══════════════════════════════════════════════════╝\n\n")
+
+cat("1. HALLAZGOS PRINCIPALES:\n")
+cat("   ├─ Concentración de mercado (IHH):", round(IHH, 0), "\n")
+cat("   ├─ Proveedores que controlan 80% del gasto:", proveedores_80, "\n")
+cat("   ├─ Casos de fraccionamiento detectados:", nrow(casos_fraccionamiento), "\n")
+cat("   └─ Órdenes con sobreprecios:", nrow(ordenes_precio_anomalo), "\n\n")
+
+cat("2. RECOMENDACIONES:\n")
+cat("   □ Auditoría inmediata a los", nrow(score_integral), "proveedores de alto riesgo\n")
+cat("   □ Investigar", nrow(proveedores_nuevos), "proveedores nuevos con contratos grandes\n")
+cat("   □ Revisar concentración fin de año (", 
+    round(mean(concentracion_fin_año$Porcentaje_Fin_Año), 1), "% promedio)\n")
+cat("   □ Fortalecer controles en tipos de contratación con mayor incidencia\n\n")
+
+cat("3. PROVEEDORES CRÍTICOS (Top 5 por riesgo):\n")
+print(score_integral %>% 
+      head(5) %>% 
+      select(RUC, Razon_Social, SCORE_RIESGO_TOTAL, Monto_Total))
+
+cat("\n4. MONTO ESTIMADO EN RIESGO:\n")
+monto_riesgo <- sum(score_integral$Monto_Total)
+cat("   S/", format(monto_riesgo, big.mark = ","), "\n")
+cat("   (", round(monto_riesgo/sum(datos$Monto_limpio)*100, 2), "% del gasto total)\n\n")
+
+```
+```{r}
+names(datos)
+
+```
+
+
+```{r}
+# ========================================
+# ANÁLISIS DE INTERVALOS DE CONFIANZA
+# ========================================
+ic_montos <- datos %>%
+  group_by(Tipo_Contratacion) %>%
+  summarise(
+    n = n(),
+    media = mean(Monto_limpio, na.rm = TRUE),
+    sd = sd(Monto_limpio, na.rm = TRUE),
+    error_std = sd / sqrt(n),
+    ic_inferior = media - 1.96 * error_std,
+    ic_superior = media + 1.96 * error_std
+  )
+
+print("INTERVALOS DE CONFIANZA (95%) PARA MONTOS PROMEDIO:")
+print(ic_montos)
+
+# Visualizar
+ggplot(ic_montos, aes(x = Tipo_Contratacion, y = media)) +
+  geom_point(size = 4) +
+  geom_errorbar(aes(ymin = ic_inferior, ymax = ic_superior), width = 0.2) +
+  labs(title = "Intervalos de Confianza para Monto Promedio por Tipo de Contratación",
+       y = "Monto Promedio (S/)", x = "Tipo de Contratación") +
+  theme_minimal()
+
+```
+
