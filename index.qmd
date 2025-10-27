@@ -20,9 +20,11 @@ datos <- read_excel("DRTC-H.xlsx")
 
 
 # Corregir nombres de columnas (quitar acentos y caracteres especiales)
-names(datos) <- c("N", "Entidad", "Tipo_Orden", "Numero_Orden", "Tipo_Contratacion",
+datos <- datos %>%
+  rename_with(~ c("N", "Entidad", "Tipo_Orden", "Numero_Orden", "Tipo_Contratacion",
                   "Fecha_Emision", "Fecha_Compromiso", "Monto", "RUC", 
-                  "Razon_Social", "Estado", "Estado_Registro", "Observaciones")
+                  "Razon_Social", "Estado", "Estado_Registro", "Observaciones")[seq_along(.)])
+
 
 # Convertir fechas a formato Date
 datos <- datos %>%
@@ -395,50 +397,59 @@ width = 8, height = 6, dpi = 300)
 ```
 
 ```{r}
+library(dplyr)
+library(ggplot2)
+library(scales)
 
-
-# Filtrar anuladas
-anuladas <- datos %>% filter(Estado == "Anulada")
+# Filtrar órdenes anuladas
+anuladas <- datos %>%
+  filter(Estado == "Anulada")
 
 # Estadísticas básicas
 total_ordenes <- nrow(datos)
 total_anuladas <- nrow(anuladas)
 porcentaje_anuladas <- round((total_anuladas / total_ordenes) * 100, 2)
 
-    # Gráfico 2: Cantidad por tipo (si hay variedad)
-    if(nrow(anuladas) > 1) {
-      p2 <- ggplot(anuladas, aes(x = reorder(Tipo_Orden, Cantidad), 
-                                         y = Cantidad, fill = Tipo_Orden)) +
-        geom_col(alpha = 0.8) +
-        geom_text(aes(label = Cantidad), hjust = -0.1, fontface = "bold") +
-        coord_flip() +
-        labs(title = "Cantidad de Órdenes Anuladas por Tipo",
-             x = "Tipo de Orden", y = "Cantidad de Órdenes") +
-        scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
-        theme_minimal() +
-        theme(legend.position = "none",
-              plot.title = element_text(face = "bold"))
-      
-      print(p2)
-    } else if(total_anuladas > 0) {
-    # Gráfico simple para pocos casos
-    Anuladas1= ggplot(anuladas, aes(x = Tipo_Orden, y = Monto_limpio, fill = Tipo_Orden)) +
-      geom_col(alpha = 0.8) +
-      geom_text(aes(label = paste0("S/. ", comma(Monto_limpio))), 
-                vjust = -0.3, fontface = "bold") +
-      labs(title = paste0("Órdenes Anuladas (", total_anuladas, " casos)"),
-           x = "Tipo de Orden", y = "Monto (S/.)") +
-      scale_y_continuous(labels = function(x) paste0("S/. ", comma(x)),
-                        expand = expansion(mult = c(0, 0.15))) +
-      theme_minimal() +
-      theme(legend.position = "none",
-            plot.title = element_text(face = "bold"))
-      
-      ggsave("Anuladas1.png", plot = Anuladas1,
-width = 8, height = 6, dpi = 300)
-      Anuladas1
-  }
+# Si hay más de una orden anulada
+if (nrow(anuladas) > 1) {
   
+  # Agrupar y contar por proveedor (puedes cambiar el nombre de columna)
+  resumen <- anuladas %>%
+    group_by(Proveedor) %>%
+    summarise(Cantidad = n())
+  
+  p2 <- ggplot(resumen, aes(x = reorder(Proveedor, Cantidad), 
+                            y = Cantidad, fill = Proveedor)) +
+    geom_col(alpha = 0.8) +
+    geom_text(aes(label = Cantidad), hjust = -0.1, fontface = "bold") +
+    coord_flip() +
+    labs(title = "Cantidad de Órdenes Anuladas por Proveedor",
+         x = "Proveedor", y = "Cantidad de Órdenes") +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+    theme_minimal() +
+    theme(legend.position = "none",
+          plot.title = element_text(face = "bold"))
+  
+  print(p2)
+  
+} else if (total_anuladas > 0) {
+  
+  Anuladas1 <- ggplot(anuladas, aes(x = Proveedor, y = Monto_limpio, fill = Proveedor)) +
+    geom_col(alpha = 0.8) +
+    geom_text(aes(label = paste0("S/. ", comma(Monto_limpio))), 
+              vjust = -0.3, fontface = "bold") +
+    labs(title = paste0("Órdenes Anuladas (", total_anuladas, " casos)"),
+         x = "Proveedor", y = "Monto (S/.)") +
+    scale_y_continuous(labels = function(x) paste0("S/. ", comma(x)),
+                       expand = expansion(mult = c(0, 0.15))) +
+    theme_minimal() +
+    theme(legend.position = "none",
+          plot.title = element_text(face = "bold"))
+  
+  ggsave("Anuladas1.png", plot = Anuladas1, width = 8, height = 6, dpi = 300)
+  print(Anuladas1)
+}
+
 ```
 
 ```{r}
@@ -710,39 +721,79 @@ tabla_final
 ```
 
 ```{r}
+library(dplyr)
+library(lubridate)
 library(randomForest)
 library(caret)
+library(ggplot2)
 
-# Crear dataset para predecir órdenes sospechosas
-datos_modelo <- datos %>%
-  left_join(concentracion_proveedores, by = "RUC") %>%
+# --- Preparar vectores seguros desde score_integral y casos_fraccionamiento ---
+# Si los objetos no existen o no tienen las columnas esperadas, quedan vacíos.
+score_rucs <- character(0)
+if (exists("score_integral")) {
+  if ("Contratista" %in% names(score_integral)) score_rucs <- as.character(score_integral$Contratista)
+  else if ("RUC" %in% names(score_integral)) score_rucs <- as.character(score_integral$RUC)
+}
+
+casos_rucs <- character(0)
+if (exists("casos_fraccionamiento")) {
+  if ("Contratista" %in% names(casos_fraccionamiento)) casos_rucs <- as.character(casos_fraccionamiento$Contratista)
+  else if ("RUC" %in% names(casos_fraccionamiento)) casos_rucs <- as.character(casos_fraccionamiento$RUC)
+}
+
+# --- Comprobar que existe la columna 'Contratista' en datos ---
+if (!"Contratista" %in% names(datos)) stop("La columna 'Contratista' no existe en 'datos'. Revisa colnames(datos).")
+
+# --- Crear Fecha_Emision (intentar varios formatos) ---
+datos <- datos %>%
   mutate(
-    Es_Sospechoso = ifelse(
-      RUC %in% score_integral$RUC | 
-      RUC %in% casos_fraccionamiento$RUC, 
-      1, 0
-    ),
-    Mes = month(Fecha_Emision),
-    Es_Fin_Año = ifelse(Mes >= 11, 1, 0),
-    Dias_Desde_Inicio = as.numeric(Fecha_Emision - min(Fecha_Emision)),
-    Monto_Normalizado = scale(Monto_limpio)[,1]
-  ) %>%
-  filter(!is.na(Es_Sospechoso))
+    Fecha_Emision = parse_date_time(
+      `Fecha de suscripción del contrato`,
+      orders = c("Y-m-d", "d/m/Y", "m/d/Y", "d-%m-%Y", "Y/%m/%d"),
+      exact = FALSE
+    ) %>% as.Date()
+  )
 
-# Entrenar modelo
-set.seed(123)
-modelo_rf <- randomForest(
-  factor(Es_Sospechoso) ~ Monto_Normalizado + Mes + Es_Fin_Año + 
-    Dias_Desde_Inicio + Participacion_Mercado,
-  data = datos_modelo,
-  ntree = 500,
-  importance = TRUE
-)
+# --- Limpiar monto y crear variables ---
+datos_modelo <- datos %>%
+  mutate(
+    # limpiar texto de Monto y convertir a numérico (quita caracteres no numéricos)
+    Monto_limpio = as.numeric(gsub(",", "", gsub("[^0-9.\\-]", "", as.character(Monto)))),
+    # marcar sospechoso usando vectores seguros
+    Es_Sospechoso = as.integer(Contratista %in% score_rucs | Contratista %in% casos_rucs),
+    # variables temporales / derivadas
+    Mes = lubridate::month(Fecha_Emision),
+    Es_Fin_Año = ifelse(!is.na(Mes) & Mes >= 11, 1L, 0L),
+    Dias_Desde_Inicio = as.numeric(Fecha_Emision - min(Fecha_Emision, na.rm = TRUE)),
+    Monto_Normalizado = ifelse(!is.na(Monto_limpio), as.numeric(scale(Monto_limpio)[,1]), NA_real_),
+    Participacion_Mercado = 0  # valor temporal
+  )
 
-# Importancia de variables
-varImpPlot(modelo_rf)
-print(importance(modelo_rf))
+# --- Opcional: ver resumen rápido ---
+cat("Filas originales:", nrow(datos), "\n")
+cat("Filas para modelo:", nrow(datos_modelo), "\n")
+cat("Total Es_Sospechoso == 1:", sum(datos_modelo$Es_Sospechoso, na.rm = TRUE), "\n")
+
+if (nrow(datos_modelo) > 10 && length(unique(na.omit(datos_modelo$Es_Sospechoso))) > 1) {
+  set.seed(123)
+  modelo_rf <- randomForest(
+    factor(Es_Sospechoso) ~ Monto_Normalizado + Mes + Es_Fin_Año + Dias_Desde_Inicio + Participacion_Mercado,
+    data = datos_modelo,
+    ntree = 500,
+    importance = TRUE
+  )
+  varImpPlot(modelo_rf)
+  print(importance(modelo_rf))
+} else {
+  message("No se entrena el modelo: no hay suficientes filas o falta diversidad en Es_Sospechoso.")
+}
+
 ```
+
+```{r}
+colnames(datos)
+```
+
 
 ```{r}
 datos <- datos %>%
@@ -762,22 +813,30 @@ datos %>%
 
 
 ```{r}
-# NUEVO: Tests estadísticos
-library(stats)
 
-# Test de diferencia antes/después cambio de gestión
+library(dplyr)
+library(stats)
+library(lubridate)
+library(benford.analysis)
+
+# Asegurar que la columna de fecha sea tipo Date
+datos <- datos %>%
+  mutate(
+    Fecha = as.Date(`Fecha de suscripción del contrato`, format = "%Y-%m-%d"),
+    Año = year(Fecha)
+  )
+
+# Test de diferencia antes/después del año 2023
 wilcox.test(
-  datos %>% filter(Año < 2023) %>% pull(Monto_limpio),
-  datos %>% filter(Año >= 2023) %>% pull(Monto_limpio)
+  datos %>% filter(Año < 2023) %>% pull(Monto),
+  datos %>% filter(Año >= 2023) %>% pull(Monto)
 )
 
 # Test de Benford para detectar manipulación de cifras
-library(benford.analysis)
-
-benford_test <- benford(datos$Monto_limpio, number.of.digits = 1)
+benford_test <- benford(datos$Monto, number.of.digits = 1)
 plot(benford_test)
 
-cat("\nTest de Benford - Desviación significativa indica manipulación de cifras\n")
+cat("\nTest de Benford - Desviación significativa indica posible manipulación de cifras\n")
 print(benford_test)
 ```
 
