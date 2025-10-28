@@ -1,13 +1,13 @@
 project:
   type: website
   render:
-    - DRTCH_RENDER.qmd
+    - presentacion.qmd
 
 website:
   title: "Investigacion_GRH"
   navbar:
     left:
-      - href: DRTCH_RENDER.qmd
+      - href: presentacion.qmd
         text: Home
       - about.qmd
 
